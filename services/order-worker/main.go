@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
 )
@@ -230,9 +231,28 @@ func main() {
 			if retries >= maxRetries {
 				log.Printf("Sending message to dead-letter queue")
 
-				// Restore the Redis inventory slot so it is not permanently
-				// lost for an order that will never complete in PostgreSQL.
-				releaseRedisReservation(ctx, rdb, delivery.Body)
+				// Restore inventory only when the reservation can be identified
+				// and safely released.
+				if releaseErr := releaseRedisReservation(
+					ctx,
+					rdb,
+					delivery.Body,
+				); releaseErr != nil {
+					log.Printf("Cannot safely dead-letter order; stopping worker: %v", releaseErr)
+					return
+				}
+
+				// Record a terminal failure before dead-lettering.
+				order, parseErr := parseOrderForFailure(delivery.Body)
+				if parseErr != nil {
+					log.Printf("Cannot record terminal order failure: %v", parseErr)
+					return
+				}
+
+				if failErr := markOrderFailed(ctx, db, order); failErr != nil {
+					log.Printf("Cannot record terminal order failure; stopping worker: %v", failErr)
+					return
+				}
 
 				err = publishAndConfirm(
 					ch,
@@ -263,8 +283,6 @@ func main() {
 			}
 
 			if err != nil {
-				// Leave the original unacknowledged. Closing the channel
-				// allows RabbitMQ to redeliver it.
 				log.Printf(
 					"Replacement publish failed; stopping worker: %v",
 					err,
@@ -272,7 +290,7 @@ func main() {
 				return
 			}
 
-			// Acknowledge the original only after the replacement is confirmed.
+			// Acknowledge only after the replacement is confirmed.
 			if err := delivery.Ack(false); err != nil {
 				log.Printf("Acknowledge original delivery: %v", err)
 			}
@@ -295,29 +313,58 @@ func cleanupRedisReservation(ctx context.Context, rdb *redis.Client, body []byte
 	}
 }
 
-// releaseRedisReservation atomically restores the Redis inventory counter for
-// an order being sent to the dead-letter queue. Uses the same Lua semantics
-// as the checkout service's release path.
-func releaseRedisReservation(ctx context.Context, rdb *redis.Client, body []byte) {
+// releaseRedisReservation atomically restores the Redis inventory counter
+// for an order that will not be retried.
+//
+// Redis command errors are returned so the caller can avoid acknowledging
+// the original RabbitMQ delivery when restoration fails.
+func releaseRedisReservation(
+	ctx context.Context,
+	rdb *redis.Client,
+	body []byte,
+) error {
 	var order OrderMessage
-	if err := json.Unmarshal(body, &order); err != nil || order.ProductID == "" || order.OrderID == "" {
-		return
+
+	if err := json.Unmarshal(body, &order); err != nil {
+		// Invalid JSON cannot identify a reservation. The message can
+		// still be sent to the DLQ.
+		return nil
 	}
 
-	vals, err := rdb.Eval(ctx, releaseScript,
+	if order.ProductID == "" || order.OrderID == "" {
+		// No usable reservation key is available.
+		return nil
+	}
+
+	vals, err := rdb.Eval(
+		ctx,
+		releaseScript,
 		[]string{"inventory:" + order.ProductID},
 		order.OrderID,
 	).Slice()
 	if err != nil {
-		log.Printf("Redis release warning for order %s: %v", order.OrderID, err)
-		return
-	}
-	if len(vals) == 2 {
-		log.Printf(
-			"Redis release for order %s: status=%v remaining=%v",
-			order.OrderID, vals[0], vals[1],
+		return fmt.Errorf(
+			"restore Redis reservation for order %s: %w",
+			order.OrderID,
+			err,
 		)
 	}
+
+	if len(vals) != 2 {
+		return fmt.Errorf(
+			"unexpected Redis release response for order %s",
+			order.OrderID,
+		)
+	}
+
+	log.Printf(
+		"Redis release for order %s: status=%v remaining=%v",
+		order.OrderID,
+		vals[0],
+		vals[1],
+	)
+
+	return nil
 }
 
 // reconcileCompletedOrders removes orphaned Redis reservation keys for orders
@@ -388,7 +435,12 @@ func recoverStuckOrders(ctx context.Context, dbURL, rabbitURL string, rdb *redis
 	}
 }
 
-func doRecovery(ctx context.Context, dbURL, rabbitURL string, rdb *redis.Client) error {
+func doRecovery(
+	ctx context.Context,
+	dbURL string,
+	rabbitURL string,
+	rdb *redis.Client,
+) error {
 	db, err := pgx.Connect(ctx, dbURL)
 	if err != nil {
 		return fmt.Errorf("recovery DB connect: %w", err)
@@ -411,48 +463,57 @@ func doRecovery(ctx context.Context, dbURL, rabbitURL string, rdb *redis.Client)
 		return fmt.Errorf("recovery enable confirms: %w", err)
 	}
 
-	recoveryConfirms := rabbitCh.NotifyPublish(make(chan amqp.Confirmation, 1))
+	recoveryConfirms := rabbitCh.NotifyPublish(
+		make(chan amqp.Confirmation, 1),
+	)
 
-	rows, err := db.Query(ctx, `
-		SELECT order_id, user_id, product_id, quantity, created_at
-		FROM orders
-		WHERE status = 'accepted'
-		  AND created_at < NOW() - $1::interval
-	`, stuckOrderThreshold.String())
+	// Load stuck orders using the independently testable query helper.
+	orders, err := loadStuckOrders(ctx, db, stuckOrderThreshold)
 	if err != nil {
-		return fmt.Errorf("query stuck orders: %w", err)
+		return err
 	}
-	defer rows.Close()
 
 	var requeued int
 
-	for rows.Next() {
-		var order OrderMessage
-		if err := rows.Scan(
-			&order.OrderID,
-			&order.UserID,
-			&order.ProductID,
-			&order.Quantity,
-			&order.CreatedAt,
-		); err != nil {
-			log.Printf("Recovery scan: %v", err)
-			continue
+	for _, order := range orders {
+		message := OrderMessage{
+			OrderID:   order.OrderID,
+			UserID:    order.UserID,
+			ProductID: order.ProductID,
+			Quantity:  order.Quantity,
+			CreatedAt: order.CreatedAt,
 		}
 
-		body, err := json.Marshal(order)
+		body, err := json.Marshal(message)
 		if err != nil {
-			log.Printf("Recovery marshal for order %s: %v", order.OrderID, err)
+			log.Printf(
+				"Recovery marshal for order %s: %v",
+				order.OrderID,
+				err,
+			)
 			continue
 		}
 
 		age := time.Since(order.CreatedAt).Round(time.Second)
 		log.Printf(
 			"Recovery: re-queuing stuck order %s (stuck for %s)",
-			order.OrderID, age,
+			order.OrderID,
+			age,
 		)
 
-		if err := publishAndConfirm(rabbitCh, recoveryConfirms, "", mainQueue, body, nil); err != nil {
-			log.Printf("Recovery: re-queue failed for order %s: %v", order.OrderID, err)
+		if err := publishAndConfirm(
+			rabbitCh,
+			recoveryConfirms,
+			"",
+			mainQueue,
+			body,
+			nil,
+		); err != nil {
+			log.Printf(
+				"Recovery: re-queue failed for order %s: %v",
+				order.OrderID,
+				err,
+			)
 			continue
 		}
 
@@ -463,7 +524,7 @@ func doRecovery(ctx context.Context, dbURL, rabbitURL string, rdb *redis.Client)
 		log.Printf("Recovery: re-queued %d stuck order(s)", requeued)
 	}
 
-	return rows.Err()
+	return nil
 }
 
 type messagePublisher interface {
@@ -523,8 +584,151 @@ func publishAndConfirm(
 	}
 }
 
+type recoveryOrder struct {
+	OrderID   string
+	UserID    string
+	ProductID string
+	Quantity  int
+	CreatedAt time.Time
+}
+
+type recoveryOrderSource interface {
+	LoadStuckOrders(ctx context.Context, threshold time.Duration) ([]recoveryOrder, error)
+}
+
+type recoveryOrdersQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+const stuckOrdersQuery = `
+	SELECT order_id, user_id, product_id, quantity, created_at
+	FROM orders
+	WHERE status = 'accepted'
+	  AND created_at < NOW() - $1::interval
+`
+
+type pgxRecoveryOrderSource struct {
+	db *pgx.Conn
+}
+
+func (source pgxRecoveryOrderSource) LoadStuckOrders(
+	ctx context.Context,
+	threshold time.Duration,
+) ([]recoveryOrder, error) {
+	return loadStuckOrders(ctx, source.db, threshold)
+}
+
+func loadStuckOrders(
+	ctx context.Context,
+	db recoveryOrdersQuerier,
+	threshold time.Duration,
+) ([]recoveryOrder, error) {
+	rows, err := db.Query(ctx, stuckOrdersQuery, threshold.String())
+	if err != nil {
+		return nil, fmt.Errorf("query stuck orders: %w", err)
+	}
+	defer rows.Close()
+
+	var orders []recoveryOrder
+
+	for rows.Next() {
+		var order recoveryOrder
+		if err := rows.Scan(
+			&order.OrderID,
+			&order.UserID,
+			&order.ProductID,
+			&order.Quantity,
+			&order.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan stuck order: %w", err)
+		}
+
+		orders = append(orders, order)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read stuck orders: %w", err)
+	}
+
+	return orders, nil
+}
+
 type orderDB interface {
 	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+type failureStatusDB interface {
+	Exec(
+		ctx context.Context,
+		sql string,
+		arguments ...any,
+	) (pgconn.CommandTag, error)
+}
+
+func parseOrderForFailure(body []byte) (OrderMessage, error) {
+	var order OrderMessage
+
+	if err := json.Unmarshal(body, &order); err != nil {
+		return OrderMessage{}, fmt.Errorf("parse failed order: %w", err)
+	}
+
+	if !uuidPattern.MatchString(order.OrderID) ||
+		order.UserID == "" ||
+		order.ProductID == "" ||
+		order.Quantity != 1 ||
+		order.CreatedAt.IsZero() {
+		return OrderMessage{}, errors.New("invalid order details for failure status")
+	}
+
+	return order, nil
+}
+
+func markOrderFailed(
+	ctx context.Context,
+	db failureStatusDB,
+	order OrderMessage,
+) error {
+	if !uuidPattern.MatchString(order.OrderID) {
+		return errors.New("cannot mark failed: invalid order ID")
+	}
+
+	if order.UserID == "" ||
+		order.ProductID == "" ||
+		order.Quantity != 1 ||
+		order.CreatedAt.IsZero() {
+		return errors.New("cannot mark failed: invalid order details")
+	}
+
+	result, err := db.Exec(ctx, `
+		INSERT INTO orders (
+			order_id, user_id, product_id, quantity, status, created_at
+		)
+		VALUES ($1, $2, $3, $4, 'failed', $5)
+		ON CONFLICT (order_id) DO UPDATE
+		SET status = 'failed'
+		WHERE orders.user_id = EXCLUDED.user_id
+		  AND orders.product_id = EXCLUDED.product_id
+		  AND orders.quantity = EXCLUDED.quantity
+		  AND orders.status = 'accepted'
+	`,
+		order.OrderID,
+		order.UserID,
+		order.ProductID,
+		order.Quantity,
+		order.CreatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("mark order failed: %w", err)
+	}
+
+	if result.RowsAffected() != 1 {
+		return fmt.Errorf(
+			"order failure was not recorded: order %s is not eligible for failure transition",
+			order.OrderID,
+		)
+	}
+
+	return nil
 }
 
 func processOrder(

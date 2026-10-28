@@ -135,6 +135,7 @@ func (h *CheckoutHandler) Checkout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.publisher.Publish(message); err != nil {
+		log.Printf("RabbitMQ publish failed for order %s: %v", order.OrderID, err)
 		var publishErr *queue.PublishError
 
 		// The message may have reached RabbitMQ. Keep the reservation
@@ -147,6 +148,7 @@ func (h *CheckoutHandler) Checkout(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		
 
 		// Release only when the publisher confirms it failed before
 		// publishing the message.
