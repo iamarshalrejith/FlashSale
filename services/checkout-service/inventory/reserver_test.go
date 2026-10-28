@@ -2,8 +2,8 @@ package inventory
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -167,25 +167,14 @@ func TestReleaseRestoresReservedInventory(t *testing.T) {
 		t.Fatalf("reservation failed: %v", err)
 	}
 
-	// Execute the release script directly against temporary Redis.
-	script, err := os.ReadFile("release.lua")
+	remaining, err := reserver.Release(
+		context.Background(), "smartphone-001", "release-user",
+	)
 	if err != nil {
-		t.Fatalf("could not read release.lua: %v", err)
+		t.Fatalf("release failed: %v", err)
 	}
-
-	result, err := reserver.client.Eval(
-		context.Background(),
-		string(script),
-		[]string{"inventory:smartphone-001"},
-		"release-user",
-	).Result()
-	if err != nil {
-		t.Fatalf("release script failed: %v", err)
-	}
-
-	values, ok := result.([]interface{})
-	if !ok || len(values) != 2 || values[0] != int64(1) {
-		t.Fatalf("unexpected release result: %#v", result)
+	if remaining != 2 {
+		t.Errorf("remaining inventory = %d, want 2", remaining)
 	}
 
 	got, err := server.Get("inventory:smartphone-001")
@@ -207,32 +196,23 @@ func TestReleaseCannotRestoreSameReservationTwice(t *testing.T) {
 		t.Fatalf("reservation failed: %v", err)
 	}
 
-	script, err := os.ReadFile("release.lua")
+	_, err = reserver.Release(
+		context.Background(), "smartphone-001", "release-once-user",
+	)
 	if err != nil {
-		t.Fatalf("could not read release.lua: %v", err)
-	}
-
-	runRelease := func() (interface{}, error) {
-		return reserver.client.Eval(
-			context.Background(),
-			string(script),
-			[]string{"inventory:smartphone-001"},
-			"release-once-user",
-		).Result()
-	}
-
-	if _, err := runRelease(); err != nil {
 		t.Fatalf("first release failed: %v", err)
 	}
 
-	result, err := runRelease()
-	if err != nil {
-		t.Fatalf("second release execution failed: %v", err)
+	_, err = reserver.Release(
+		context.Background(), "smartphone-001", "release-once-user",
+	)
+	if err == nil {
+		t.Fatal("expected second release to fail")
 	}
 
-	values, ok := result.([]interface{})
-	if !ok || len(values) != 2 || values[0] != int64(0) {
-		t.Fatalf("expected NO_RESERVATION on second release, got %#v", result)
+	var releaseErr *ReservationError
+	if !errors.As(err, &releaseErr) || releaseErr.Code != "NO_RESERVATION" {
+		t.Fatalf("expected NO_RESERVATION, got %v", err)
 	}
 
 	got, err := server.Get("inventory:smartphone-001")

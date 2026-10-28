@@ -11,6 +11,9 @@ import (
 //go:embed reserve.lua
 var reserveScript string
 
+//go:embed release.lua
+var releaseScript string
+
 type Reserver struct {
 	client *redis.Client
 }
@@ -50,19 +53,49 @@ func (r *Reserver) Reserve(
 		return 0, fmt.Errorf("execute reservation script: %w", err)
 	}
 
+	return parseScriptResult(result, "reservation")
+}
+
+// Release restores inventory only when the user's reservation exists.
+// Call this only when it is safe to conclude that the order was not accepted.
+func (r *Reserver) Release(
+	ctx context.Context,
+	productID string,
+	userID string,
+) (int64, error) {
+	if productID == "" || userID == "" {
+		return 0, fmt.Errorf("invalid release request")
+	}
+
+	key := "inventory:" + productID
+
+	result, err := r.client.Eval(
+		ctx,
+		releaseScript,
+		[]string{key},
+		userID,
+	).Result()
+	if err != nil {
+		return 0, fmt.Errorf("execute release script: %w", err)
+	}
+
+	return parseScriptResult(result, "release")
+}
+
+func parseScriptResult(result interface{}, operation string) (int64, error) {
 	values, ok := result.([]interface{})
 	if !ok || len(values) != 2 {
-		return 0, fmt.Errorf("unexpected reservation result")
+		return 0, fmt.Errorf("unexpected %s result", operation)
 	}
 
 	status, ok := values[0].(int64)
 	if !ok {
-		return 0, fmt.Errorf("invalid reservation status")
+		return 0, fmt.Errorf("invalid %s status", operation)
 	}
 
 	message, ok := values[1].(string)
 	if !ok {
-		return 0, fmt.Errorf("invalid reservation response")
+		return 0, fmt.Errorf("invalid %s response", operation)
 	}
 
 	if status != 1 {
@@ -71,7 +104,7 @@ func (r *Reserver) Reserve(
 
 	var remaining int64
 	if _, err := fmt.Sscan(message, &remaining); err != nil {
-		return 0, fmt.Errorf("invalid remaining inventory: %w", err)
+		return 0, fmt.Errorf("invalid remaining inventory after %s: %w", operation, err)
 	}
 
 	return remaining, nil
