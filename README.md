@@ -1,5 +1,3 @@
-
-@'
 # FlashSale — High-Concurrency Checkout System
 
 A flash-sale checkout system designed to reserve limited inventory safely during concurrent purchase requests. The project uses Go, Redis Lua scripting, RabbitMQ, PostgreSQL, Docker Compose, and k6.
