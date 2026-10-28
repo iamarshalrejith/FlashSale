@@ -39,6 +39,56 @@ func TestProcessOrderInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestProcessOrderNewOrderDeductsInventoryAndCompletes(t *testing.T) {
+	db, err := pgxmock.NewConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	order := validTestOrder()
+	body, err := json.Marshal(order)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db.ExpectBegin()
+
+	db.ExpectQuery("INSERT INTO orders").
+		WithArgs(
+			order.OrderID,
+			order.UserID,
+			order.ProductID,
+			order.Quantity,
+			order.CreatedAt,
+		).
+		WillReturnRows(
+			pgxmock.NewRows([]string{"order_id"}).AddRow(order.OrderID),
+		)
+
+	db.ExpectExec("UPDATE inventory").
+		WithArgs(order.ProductID, order.Quantity).
+		WillReturnResult(pgconn.NewCommandTag("UPDATE 1"))
+
+	db.ExpectExec("UPDATE orders").
+		WithArgs(
+			order.OrderID,
+			order.UserID,
+			order.ProductID,
+			order.Quantity,
+		).
+		WillReturnResult(pgconn.NewCommandTag("UPDATE 1"))
+
+	db.ExpectCommit()
+
+	if err := processOrder(context.Background(), db, body); err != nil {
+		t.Fatalf("processOrder returned error: %v", err)
+	}
+
+	if err := db.ExpectationsWereMet(); err != nil {
+		t.Fatalf("database expectations not met: %v", err)
+	}
+}
+
 func TestProcessOrderDuplicatePreservesCompletion(t *testing.T) {
 	db, err := pgxmock.NewConn()
 	if err != nil {
@@ -52,14 +102,29 @@ func TestProcessOrderDuplicatePreservesCompletion(t *testing.T) {
 	}
 
 	db.ExpectBegin()
-	db.ExpectExec("INSERT INTO orders").
-		WithArgs(order.OrderID, order.UserID, order.ProductID, order.Quantity, order.CreatedAt).
-		WillReturnResult(pgconn.NewCommandTag("INSERT 0 0"))
 
-	db.ExpectExec("UPDATE orders").
-		WithArgs(order.OrderID, order.UserID, order.ProductID, order.Quantity).
-		WillReturnResult(pgconn.NewCommandTag("UPDATE 1"))
+	db.ExpectQuery("INSERT INTO orders").
+		WithArgs(
+			order.OrderID,
+			order.UserID,
+			order.ProductID,
+			order.Quantity,
+			order.CreatedAt,
+		).
+		WillReturnRows(pgxmock.NewRows([]string{"order_id"}))
 
+	db.ExpectQuery("SELECT EXISTS").
+		WithArgs(
+			order.OrderID,
+			order.UserID,
+			order.ProductID,
+			order.Quantity,
+		).
+		WillReturnRows(
+			pgxmock.NewRows([]string{"exists"}).AddRow(true),
+		)
+
+	// Duplicate delivery must not deduct inventory again.
 	db.ExpectCommit()
 
 	if err := processOrder(context.Background(), db, body); err != nil {
@@ -84,13 +149,27 @@ func TestProcessOrderConflictingDuplicateRollsBack(t *testing.T) {
 	}
 
 	db.ExpectBegin()
-	db.ExpectExec("INSERT INTO orders").
-		WithArgs(order.OrderID, order.UserID, order.ProductID, order.Quantity, order.CreatedAt).
-		WillReturnResult(pgconn.NewCommandTag("INSERT 0 0"))
 
-	db.ExpectExec("UPDATE orders").
-		WithArgs(order.OrderID, order.UserID, order.ProductID, order.Quantity).
-		WillReturnResult(pgconn.NewCommandTag("UPDATE 0"))
+	db.ExpectQuery("INSERT INTO orders").
+		WithArgs(
+			order.OrderID,
+			order.UserID,
+			order.ProductID,
+			order.Quantity,
+			order.CreatedAt,
+		).
+		WillReturnRows(pgxmock.NewRows([]string{"order_id"}))
+
+	db.ExpectQuery("SELECT EXISTS").
+		WithArgs(
+			order.OrderID,
+			order.UserID,
+			order.ProductID,
+			order.Quantity,
+		).
+		WillReturnRows(
+			pgxmock.NewRows([]string{"exists"}).AddRow(false),
+		)
 
 	db.ExpectRollback()
 
@@ -118,8 +197,15 @@ func TestProcessOrderDatabaseErrorRollsBack(t *testing.T) {
 	}
 
 	db.ExpectBegin()
-	db.ExpectExec("INSERT INTO orders").
-		WithArgs(order.OrderID, order.UserID, order.ProductID, order.Quantity, order.CreatedAt).
+
+	db.ExpectQuery("INSERT INTO orders").
+		WithArgs(
+			order.OrderID,
+			order.UserID,
+			order.ProductID,
+			order.Quantity,
+			order.CreatedAt,
+		).
 		WillReturnError(errors.New("simulated database failure"))
 
 	db.ExpectRollback()
@@ -127,6 +213,49 @@ func TestProcessOrderDatabaseErrorRollsBack(t *testing.T) {
 	err = processOrder(context.Background(), db, body)
 	if err == nil {
 		t.Fatal("expected a database error")
+	}
+
+	if err := db.ExpectationsWereMet(); err != nil {
+		t.Fatalf("database expectations not met: %v", err)
+	}
+}
+
+func TestProcessOrderInsufficientInventoryRollsBack(t *testing.T) {
+	db, err := pgxmock.NewConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	order := validTestOrder()
+	body, err := json.Marshal(order)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db.ExpectBegin()
+
+	db.ExpectQuery("INSERT INTO orders").
+		WithArgs(
+			order.OrderID,
+			order.UserID,
+			order.ProductID,
+			order.Quantity,
+			order.CreatedAt,
+		).
+		WillReturnRows(
+			pgxmock.NewRows([]string{"order_id"}).AddRow(order.OrderID),
+		)
+
+	db.ExpectExec("UPDATE inventory").
+		WithArgs(order.ProductID, order.Quantity).
+		WillReturnResult(pgconn.NewCommandTag("UPDATE 0"))
+
+	db.ExpectRollback()
+
+	err = processOrder(context.Background(), db, body)
+	var permanentErr *PermanentError
+	if !errors.As(err, &permanentErr) {
+		t.Fatalf("expected PermanentError for insufficient inventory, got %v", err)
 	}
 
 	if err := db.ExpectationsWereMet(); err != nil {
@@ -218,8 +347,11 @@ func TestPublishAndConfirmAck(t *testing.T) {
 	}
 	if publisher.exchange != "flashsale.retry" ||
 		publisher.routingKey != "retry" {
-		t.Fatalf("unexpected destination: %s / %s",
-			publisher.exchange, publisher.routingKey)
+		t.Fatalf(
+			"unexpected destination: %s / %s",
+			publisher.exchange,
+			publisher.routingKey,
+		)
 	}
 	if publisher.message.DeliveryMode != amqp.Persistent {
 		t.Fatal("expected persistent message")

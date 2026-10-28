@@ -204,4 +204,37 @@ Expected recorded result: 20 completed orders per test product.
 - Do not paste credentials into logs, screenshots, or reports.
 - Rotate credentials that have been exposed and update the matching service configuration.
 - The current Compose setup is intended for local demonstration, not production deployment without additional security and operational hardening.
-'@ | Set-Content -Encoding utf8 .\README.md
+
+## Latest Verification — October 28, 2026
+
+### End-to-end checkout
+
+A live checkout was submitted through the Nginx gateway at `http://localhost:8088/api/checkout`.
+
+Verified results:
+
+- Checkout API accepted the request and queued the order.
+- Redis reserved one unit of `smartphone-001`.
+- The Go order worker processed the order.
+- PostgreSQL persisted the order with status `completed` and a populated `processed_at` timestamp.
+- PostgreSQL inventory decreased from 499 to 498.
+- Redis inventory decreased from 483 to 482.
+
+Diagnostic order ID: `f6b34c84-4496-4cb8-8365-a37be21c55db`
+
+### Additional Go test verification
+
+- Checkout service: `go test -race -count=1 ./...` passed.
+- Order worker: `go test -race -count=1 ./...` passed.
+- Order-status service: `go test -race -count=1 ./...` compiled successfully; no test files were present.
+
+### Known issues and pending validation
+
+- Redis and PostgreSQL inventory values are not reconciled.
+- Two historical orders remain in `accepted` status and require investigation.
+- The historical inventory discrepancy remains unexplained.
+- Retry and dead-letter queue failure scenarios need further validation.
+- The recorded 30-request concurrency test does not establish the 100,000-request target.
+- Frontend bundle size, time to interactive, and gateway load-balancing performance still require measurement.
+
+Do not reset inventory or purge RabbitMQ queues without preserving relevant test data.

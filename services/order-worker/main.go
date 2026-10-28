@@ -283,14 +283,12 @@ func processOrder(
 ) error {
 	var order OrderMessage
 
-	// Invalid JSON is a permanent error, not a transient DB failure.
 	if err := json.Unmarshal(body, &order); err != nil {
 		return &PermanentError{
 			Err: fmt.Errorf("invalid order JSON: %w", err),
 		}
 	}
 
-	// Validate required fields before contacting the database.
 	if !uuidPattern.MatchString(order.OrderID) {
 		return permanentError("order_id must be a valid UUID")
 	}
@@ -302,44 +300,86 @@ func processOrder(
 		return permanentError("order message has missing or invalid fields")
 	}
 
-	// Use one transaction so the insert and completion update commit together.
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin order transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	_, err = tx.Exec(ctx, `
+	// Insert only if this order ID is new.
+	// RETURNING lets us avoid decrementing stock for duplicate deliveries.
+	var insertedOrderID string
+	err = tx.QueryRow(ctx, `
 		INSERT INTO orders (
-			order_id,
-			user_id,
-			product_id,
-			quantity,
-			status,
-			created_at
+			order_id, user_id, product_id, quantity, status, created_at
 		)
 		VALUES ($1, $2, $3, $4, 'accepted', $5)
 		ON CONFLICT (order_id) DO NOTHING
+		RETURNING order_id
 	`,
 		order.OrderID,
 		order.UserID,
 		order.ProductID,
 		order.Quantity,
 		order.CreatedAt,
-	)
+	).Scan(&insertedOrderID)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		// This ID already exists. Verify the original order matches.
+		var matches bool
+		err = tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM orders
+				WHERE order_id = $1
+				  AND user_id = $2
+				  AND product_id = $3
+				  AND quantity = $4
+			)
+		`,
+			order.OrderID,
+			order.UserID,
+			order.ProductID,
+			order.Quantity,
+		).Scan(&matches)
+		if err != nil {
+			return fmt.Errorf("verify duplicate order: %w", err)
+		}
+		if !matches {
+			return permanentError(
+				"order ID already exists with conflicting order details",
+			)
+		}
+
+		// The original order was already inserted. Do not deduct stock again.
+		return tx.Commit(ctx)
+	}
 	if err != nil {
 		return fmt.Errorf("insert order into PostgreSQL: %w", err)
 	}
 
-	// Only complete an order if its identifying fields match.
-	// This prevents a conflicting duplicate ID from changing another order.
+	// This order is new: reserve durable inventory inside the same transaction.
 	result, err := tx.Exec(ctx, `
+		UPDATE inventory
+		SET stock = stock - $2,
+		    updated_at = NOW()
+		WHERE product_id = $1
+		  AND stock >= $2
+	`,
+		order.ProductID,
+		order.Quantity,
+	)
+	if err != nil {
+		return fmt.Errorf("decrement PostgreSQL inventory: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return permanentError("insufficient PostgreSQL inventory")
+	}
+
+	result, err = tx.Exec(ctx, `
 		UPDATE orders
 		SET status = 'completed',
-		    processed_at = CASE
-		        WHEN status = 'completed' THEN processed_at
-		        ELSE NOW()
-		    END
+		    processed_at = NOW()
 		WHERE order_id = $1
 		  AND user_id = $2
 		  AND product_id = $3
@@ -351,13 +391,10 @@ func processOrder(
 		order.Quantity,
 	)
 	if err != nil {
-		return fmt.Errorf("update order status in PostgreSQL: %w", err)
+		return fmt.Errorf("complete order in PostgreSQL: %w", err)
 	}
-
 	if result.RowsAffected() != 1 {
-		return permanentError(
-			"order ID already exists with conflicting order details",
-		)
+		return fmt.Errorf("order completion affected an unexpected number of rows")
 	}
 
 	if err := tx.Commit(ctx); err != nil {

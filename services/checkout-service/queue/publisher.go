@@ -9,8 +9,9 @@ import (
 )
 
 type PublishError struct {
-	Err       error
-	Uncertain bool
+	Err        error
+	Uncertain  bool
+	PrePublish bool
 }
 
 func (e *PublishError) Error() string {
@@ -59,7 +60,6 @@ func NewPublisher(url string) (*Publisher, error) {
 		_ = conn.Close()
 	}
 
-	// Declare the queues and dead-letter infrastructure once.
 	ch, err := conn.Channel()
 	if err != nil {
 		_ = conn.Close()
@@ -158,7 +158,11 @@ func (p *Publisher) Publish(body []byte) error {
 	defer p.mu.RUnlock()
 
 	if p.closed {
-		return fmt.Errorf("publisher is closed")
+		return &PublishError{
+			Err:        fmt.Errorf("publisher is closed"),
+			Uncertain:  false,
+			PrePublish: true,
+		}
 	}
 
 	var slot *publisherSlot
@@ -169,7 +173,11 @@ func (p *Publisher) Publish(body []byte) error {
 	select {
 	case slot = <-p.slots:
 	case <-timer.C:
-		return fmt.Errorf("timed out waiting for an available publisher channel")
+		return &PublishError{
+			Err:        fmt.Errorf("timed out waiting for an available publisher channel"),
+			Uncertain:  false,
+			PrePublish: true,
+		}
 	}
 
 	healthy := false

@@ -33,10 +33,10 @@ func NewReserver(client *redis.Client) *Reserver {
 func (r *Reserver) Reserve(
 	ctx context.Context,
 	productID string,
-	userID string,
+	orderID string,
 	quantity int,
 ) (int64, error) {
-	if productID == "" || userID == "" || quantity != 1 {
+	if productID == "" || orderID == "" || quantity != 1 {
 		return 0, fmt.Errorf("invalid reservation request")
 	}
 
@@ -47,7 +47,7 @@ func (r *Reserver) Reserve(
 		reserveScript,
 		[]string{key},
 		quantity,
-		userID,
+		orderID,
 	).Result()
 	if err != nil {
 		return 0, fmt.Errorf("execute reservation script: %w", err)
@@ -56,14 +56,14 @@ func (r *Reserver) Reserve(
 	return parseScriptResult(result, "reservation")
 }
 
-// Release restores inventory only when the user's reservation exists.
-// Call this only when it is safe to conclude that the order was not accepted.
+// Release restores inventory only for this exact order's reservation.
+// Call only when it is safe to conclude that the order was not accepted.
 func (r *Reserver) Release(
 	ctx context.Context,
 	productID string,
-	userID string,
+	orderID string,
 ) (int64, error) {
-	if productID == "" || userID == "" {
+	if productID == "" || orderID == "" {
 		return 0, fmt.Errorf("invalid release request")
 	}
 
@@ -73,7 +73,7 @@ func (r *Reserver) Release(
 		ctx,
 		releaseScript,
 		[]string{key},
-		userID,
+		orderID,
 	).Result()
 	if err != nil {
 		return 0, fmt.Errorf("execute release script: %w", err)
