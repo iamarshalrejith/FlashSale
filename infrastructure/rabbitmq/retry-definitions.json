@@ -1,0 +1,37 @@
+
+{
+  "exchanges": [
+    {
+      "name": "flashsale.retry",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    }
+  ],
+  "queues": [
+    {
+      "name": "flashsale.orders.retry",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 5000,
+        "x-dead-letter-exchange": "",
+        "x-dead-letter-routing-key": "flashsale.orders"
+      }
+    }
+  ],
+  "bindings": [
+    {
+      "source": "flashsale.retry",
+      "vhost": "/",
+      "destination": "flashsale.orders.retry",
+      "destination_type": "queue",
+      "routing_key": "retry",
+      "arguments": {}
+    }
+  ]
+}
