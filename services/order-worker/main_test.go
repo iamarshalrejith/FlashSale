@@ -103,6 +103,7 @@ func TestProcessOrderDuplicatePreservesCompletion(t *testing.T) {
 
 	db.ExpectBegin()
 
+	// INSERT conflicts → no row returned.
 	db.ExpectQuery("INSERT INTO orders").
 		WithArgs(
 			order.OrderID,
@@ -113,18 +114,14 @@ func TestProcessOrderDuplicatePreservesCompletion(t *testing.T) {
 		).
 		WillReturnRows(pgxmock.NewRows([]string{"order_id"}))
 
-	db.ExpectQuery("SELECT EXISTS").
-		WithArgs(
-			order.OrderID,
-			order.UserID,
-			order.ProductID,
-			order.Quantity,
-		).
+	// New: check the existing row's status first.
+	db.ExpectQuery("SELECT status FROM orders WHERE order_id").
+		WithArgs(order.OrderID).
 		WillReturnRows(
-			pgxmock.NewRows([]string{"exists"}).AddRow(true),
+			pgxmock.NewRows([]string{"status"}).AddRow("completed"),
 		)
 
-	// Duplicate delivery must not deduct inventory again.
+	// Already completed — commit the no-op; no inventory touch.
 	db.ExpectCommit()
 
 	if err := processOrder(context.Background(), db, body); err != nil {
@@ -150,6 +147,7 @@ func TestProcessOrderConflictingDuplicateRollsBack(t *testing.T) {
 
 	db.ExpectBegin()
 
+	// INSERT conflicts → no row returned.
 	db.ExpectQuery("INSERT INTO orders").
 		WithArgs(
 			order.OrderID,
@@ -160,6 +158,14 @@ func TestProcessOrderConflictingDuplicateRollsBack(t *testing.T) {
 		).
 		WillReturnRows(pgxmock.NewRows([]string{"order_id"}))
 
+	// New: check the existing row's status first — still 'accepted'.
+	db.ExpectQuery("SELECT status FROM orders WHERE order_id").
+		WithArgs(order.OrderID).
+		WillReturnRows(
+			pgxmock.NewRows([]string{"status"}).AddRow("accepted"),
+		)
+
+	// Field-match check: different user/product → returns false.
 	db.ExpectQuery("SELECT EXISTS").
 		WithArgs(
 			order.OrderID,

@@ -15,6 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -24,7 +25,39 @@ const (
 	dlxExchange    = "flashsale.dlx"
 	maxRetries     = 3
 	publishTimeout = 3 * time.Second
+
+	// stuckOrderThreshold: how long an order may sit in 'accepted' before the
+	// recovery loop re-queues it. 10 minutes comfortably exceeds normal
+	// processing latency while catching genuinely lost messages.
+	stuckOrderThreshold = 10 * time.Minute
+
+	// recoveryInterval: how often the stuck-order scan runs.
+	recoveryInterval = 5 * time.Minute
 )
+
+// releaseScript atomically restores a Redis inventory reservation.
+// Mirrors checkout-service/inventory/release.lua so both services use the
+// same semantics when releasing a slot.
+const releaseScript = `
+local inventory_key = KEYS[1]
+local order_id      = ARGV[1]
+ 
+if not order_id or order_id == "" then
+    return {0, "INVALID_ORDER"}
+end
+ 
+local reservation_key = inventory_key .. ":reservation:" .. order_id
+local quantity = tonumber(redis.call("GET", reservation_key) or "0")
+ 
+if not quantity or quantity < 1 then
+    return {0, "NO_RESERVATION"}
+end
+ 
+local remaining = redis.call("INCRBY", inventory_key, quantity)
+redis.call("DEL", reservation_key)
+ 
+return {1, tostring(remaining)}
+`
 
 var uuidPattern = regexp.MustCompile(
 	`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`,
@@ -115,6 +148,25 @@ func main() {
 		log.Fatalf("Ping PostgreSQL: %v", err)
 	}
 
+	// Redis client — used to clean up reservation keys and to restore
+	// inventory when an order is permanently failed.
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     envOr("REDIS_ADDR", "localhost:6379"),
+		Password: os.Getenv("REDIS_PASSWORD"),
+	})
+	defer rdb.Close()
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Fatalf("Ping Redis: %v", err)
+	}
+
+	// On startup, delete orphaned reservation keys for orders that PostgreSQL
+	// already considers completed or failed. These accumulate when the worker
+	// commits a transaction but crashes before the DEL runs.
+	if err := reconcileCompletedOrders(ctx, db, rdb); err != nil {
+		log.Printf("Startup reconcile warning (non-fatal): %v", err)
+	}
+
 	messages, err := ch.Consume(
 		mainQueue,
 		"flashsale-order-worker",
@@ -127,6 +179,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("Start RabbitMQ consumer: %v", err)
 	}
+
+	// Recovery goroutine uses its own DB and AMQP connections so it never
+	// races with the main consumer loop.
+	go recoverStuckOrders(ctx, dbURL, rabbitURL, rdb)
 
 	log.Printf(
 		"Order worker started; waiting for messages (max retries: %d)",
@@ -147,6 +203,11 @@ func main() {
 
 			err := processOrder(ctx, db, delivery.Body)
 			if err == nil {
+				// Order committed to PostgreSQL. The Redis inventory counter
+				// was already decremented at checkout; we only remove the
+				// per-order reservation marker the checkout service created.
+				cleanupRedisReservation(ctx, rdb, delivery.Body)
+
 				if ackErr := delivery.Ack(false); ackErr != nil {
 					log.Printf("Acknowledge processed order: %v", ackErr)
 				}
@@ -168,6 +229,10 @@ func main() {
 
 			if retries >= maxRetries {
 				log.Printf("Sending message to dead-letter queue")
+
+				// Restore the Redis inventory slot so it is not permanently
+				// lost for an order that will never complete in PostgreSQL.
+				releaseRedisReservation(ctx, rdb, delivery.Body)
 
 				err = publishAndConfirm(
 					ch,
@@ -213,6 +278,192 @@ func main() {
 			}
 		}
 	}
+}
+
+// cleanupRedisReservation removes the per-order reservation marker after a
+// successful PostgreSQL commit. The main inventory counter (inventory:<id>)
+// was decremented at checkout and must not be changed here.
+func cleanupRedisReservation(ctx context.Context, rdb *redis.Client, body []byte) {
+	var order OrderMessage
+	if err := json.Unmarshal(body, &order); err != nil || order.ProductID == "" || order.OrderID == "" {
+		return
+	}
+
+	key := "inventory:" + order.ProductID + ":reservation:" + order.OrderID
+	if err := rdb.Del(ctx, key).Err(); err != nil {
+		log.Printf("Redis cleanup warning: could not delete %s: %v", key, err)
+	}
+}
+
+// releaseRedisReservation atomically restores the Redis inventory counter for
+// an order being sent to the dead-letter queue. Uses the same Lua semantics
+// as the checkout service's release path.
+func releaseRedisReservation(ctx context.Context, rdb *redis.Client, body []byte) {
+	var order OrderMessage
+	if err := json.Unmarshal(body, &order); err != nil || order.ProductID == "" || order.OrderID == "" {
+		return
+	}
+
+	vals, err := rdb.Eval(ctx, releaseScript,
+		[]string{"inventory:" + order.ProductID},
+		order.OrderID,
+	).Slice()
+	if err != nil {
+		log.Printf("Redis release warning for order %s: %v", order.OrderID, err)
+		return
+	}
+	if len(vals) == 2 {
+		log.Printf(
+			"Redis release for order %s: status=%v remaining=%v",
+			order.OrderID, vals[0], vals[1],
+		)
+	}
+}
+
+// reconcileCompletedOrders removes orphaned Redis reservation keys for orders
+// that PostgreSQL already considers completed or failed. Runs once on startup.
+//
+// Source of truth: PostgreSQL.
+// Redis reservation keys are ephemeral metadata; their absence never causes
+// incorrect stock counts because the main Redis counter was adjusted
+// atomically at checkout and is restored when an order is released.
+func reconcileCompletedOrders(ctx context.Context, db *pgx.Conn, rdb *redis.Client) error {
+	rows, err := db.Query(ctx, `
+		SELECT order_id, product_id
+		FROM orders
+		WHERE status IN ('completed', 'failed')
+	`)
+	if err != nil {
+		return fmt.Errorf("query completed/failed orders: %w", err)
+	}
+	defer rows.Close()
+
+	var cleaned int
+
+	for rows.Next() {
+		var orderID, productID string
+		if err := rows.Scan(&orderID, &productID); err != nil {
+			log.Printf("Reconcile scan: %v", err)
+			continue
+		}
+
+		key := "inventory:" + productID + ":reservation:" + orderID
+		n, err := rdb.Del(ctx, key).Result()
+		if err != nil {
+			log.Printf("Reconcile: could not delete %s: %v", key, err)
+			continue
+		}
+		if n > 0 {
+			cleaned++
+			log.Printf("Reconcile: removed orphaned reservation key for order %s", orderID)
+		}
+	}
+
+	if cleaned > 0 {
+		log.Printf("Reconcile: cleaned %d orphaned reservation key(s)", cleaned)
+	}
+
+	return rows.Err()
+}
+
+// recoverStuckOrders runs on its own connections so it never races with the
+// main consumer loop. Every recoveryInterval it looks for orders that have
+// been in 'accepted' longer than stuckOrderThreshold and re-publishes them
+// to the main queue. processOrder's idempotency logic makes this safe:
+// - If the order already completed: the duplicate path returns early.
+// - If the order never committed: it is processed for the first time.
+func recoverStuckOrders(ctx context.Context, dbURL, rabbitURL string, rdb *redis.Client) {
+	ticker := time.NewTicker(recoveryInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := doRecovery(ctx, dbURL, rabbitURL, rdb); err != nil {
+				log.Printf("Stuck-order recovery error: %v", err)
+			}
+		}
+	}
+}
+
+func doRecovery(ctx context.Context, dbURL, rabbitURL string, rdb *redis.Client) error {
+	db, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		return fmt.Errorf("recovery DB connect: %w", err)
+	}
+	defer db.Close(ctx)
+
+	rabbitConn, err := amqp.Dial(rabbitURL)
+	if err != nil {
+		return fmt.Errorf("recovery AMQP connect: %w", err)
+	}
+	defer rabbitConn.Close()
+
+	rabbitCh, err := rabbitConn.Channel()
+	if err != nil {
+		return fmt.Errorf("recovery AMQP channel: %w", err)
+	}
+	defer rabbitCh.Close()
+
+	if err := rabbitCh.Confirm(false); err != nil {
+		return fmt.Errorf("recovery enable confirms: %w", err)
+	}
+
+	recoveryConfirms := rabbitCh.NotifyPublish(make(chan amqp.Confirmation, 1))
+
+	rows, err := db.Query(ctx, `
+		SELECT order_id, user_id, product_id, quantity, created_at
+		FROM orders
+		WHERE status = 'accepted'
+		  AND created_at < NOW() - $1::interval
+	`, stuckOrderThreshold.String())
+	if err != nil {
+		return fmt.Errorf("query stuck orders: %w", err)
+	}
+	defer rows.Close()
+
+	var requeued int
+
+	for rows.Next() {
+		var order OrderMessage
+		if err := rows.Scan(
+			&order.OrderID,
+			&order.UserID,
+			&order.ProductID,
+			&order.Quantity,
+			&order.CreatedAt,
+		); err != nil {
+			log.Printf("Recovery scan: %v", err)
+			continue
+		}
+
+		body, err := json.Marshal(order)
+		if err != nil {
+			log.Printf("Recovery marshal for order %s: %v", order.OrderID, err)
+			continue
+		}
+
+		age := time.Since(order.CreatedAt).Round(time.Second)
+		log.Printf(
+			"Recovery: re-queuing stuck order %s (stuck for %s)",
+			order.OrderID, age,
+		)
+
+		if err := publishAndConfirm(rabbitCh, recoveryConfirms, "", mainQueue, body, nil); err != nil {
+			log.Printf("Recovery: re-queue failed for order %s: %v", order.OrderID, err)
+			continue
+		}
+
+		requeued++
+	}
+
+	if requeued > 0 {
+		log.Printf("Recovery: re-queued %d stuck order(s)", requeued)
+	}
+
+	return rows.Err()
 }
 
 type messagePublisher interface {
@@ -307,7 +558,7 @@ func processOrder(
 	defer tx.Rollback(ctx)
 
 	// Insert only if this order ID is new.
-	// RETURNING lets us avoid decrementing stock for duplicate deliveries.
+	// RETURNING lets us detect whether the row was inserted this delivery.
 	var insertedOrderID string
 	err = tx.QueryRow(ctx, `
 		INSERT INTO orders (
@@ -325,16 +576,32 @@ func processOrder(
 	).Scan(&insertedOrderID)
 
 	if errors.Is(err, pgx.ErrNoRows) {
-		// This ID already exists. Verify the original order matches.
+		// Row already exists — check its current status.
+		var currentStatus string
+		err = tx.QueryRow(ctx, `
+			SELECT status FROM orders WHERE order_id = $1
+		`, order.OrderID).Scan(&currentStatus)
+		if err != nil {
+			return fmt.Errorf("fetch existing order status: %w", err)
+		}
+
+		if currentStatus == "completed" || currentStatus == "failed" {
+			// Already at a terminal state; nothing to do.
+			return tx.Commit(ctx)
+		}
+
+		// Status is still 'accepted': a prior run inserted it but crashed
+		// before committing the inventory deduction and status update.
+		// Verify the message fields match the stored record.
 		var matches bool
 		err = tx.QueryRow(ctx, `
 			SELECT EXISTS (
 				SELECT 1
 				FROM orders
-				WHERE order_id = $1
-				  AND user_id = $2
+				WHERE order_id   = $1
+				  AND user_id    = $2
 				  AND product_id = $3
-				  AND quantity = $4
+				  AND quantity   = $4
 			)
 		`,
 			order.OrderID,
@@ -351,17 +618,47 @@ func processOrder(
 			)
 		}
 
-		// The original order was already inserted. Do not deduct stock again.
-		return tx.Commit(ctx)
-	}
-	if err != nil {
+		// Determine whether inventory was deducted in the prior attempt.
+		// processed_at is set in the same UPDATE that marks the order
+		// 'completed', so its presence means inventory was already taken.
+		var alreadyDecremented bool
+		err = tx.QueryRow(ctx, `
+			SELECT processed_at IS NOT NULL FROM orders WHERE order_id = $1
+		`, order.OrderID).Scan(&alreadyDecremented)
+		if err != nil {
+			return fmt.Errorf("check processed_at for stuck order: %w", err)
+		}
+
+		if alreadyDecremented {
+			// Inventory was taken; only the status commit was lost. Re-apply
+			// it without touching stock.
+			_, err = tx.Exec(ctx, `
+				UPDATE orders
+				SET status = 'completed'
+				WHERE order_id = $1 AND status != 'completed'
+			`, order.OrderID)
+			if err != nil {
+				return fmt.Errorf("re-complete stuck order: %w", err)
+			}
+			return tx.Commit(ctx)
+		}
+
+		// The prior attempt did not deduct inventory. Fall through to the
+		// deduction block using the existing order record.
+		insertedOrderID = order.OrderID
+
+	} else if err != nil {
 		return fmt.Errorf("insert order into PostgreSQL: %w", err)
 	}
 
-	// This order is new: reserve durable inventory inside the same transaction.
+	// Deduct inventory. This runs for genuinely new orders (insertedOrderID
+	// was just set from RETURNING) and for stuck orders whose prior attempt
+	// did not reach the inventory UPDATE.
+	_ = insertedOrderID // used only to distinguish the two cases above
+
 	result, err := tx.Exec(ctx, `
 		UPDATE inventory
-		SET stock = stock - $2,
+		SET stock      = stock - $2,
 		    updated_at = NOW()
 		WHERE product_id = $1
 		  AND stock >= $2
@@ -378,12 +675,12 @@ func processOrder(
 
 	result, err = tx.Exec(ctx, `
 		UPDATE orders
-		SET status = 'completed',
+		SET status       = 'completed',
 		    processed_at = NOW()
-		WHERE order_id = $1
-		  AND user_id = $2
+		WHERE order_id   = $1
+		  AND user_id    = $2
 		  AND product_id = $3
-		  AND quantity = $4
+		  AND quantity   = $4
 	`,
 		order.OrderID,
 		order.UserID,
