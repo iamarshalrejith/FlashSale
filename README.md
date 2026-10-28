@@ -358,17 +358,3 @@ FlashSale demonstrates a Go-based checkout workflow built around atomic inventor
 
 The measured 1,000 RPS run achieved approximately 987 requests/second but failed its configured thresholds due to dropped iterations. The 10,000 RPS assessment target has not been demonstrated, and one dead-letter message observed during testing still requires investigation. These limitations are documented deliberately so that the results remain reproducible and technically honest.
 
-## 15. Interview discussion topics
-
-Be prepared to explain:
-
-1. Why a Lua script prevents the Redis check-then-decrement race condition.
-2. Why RabbitMQ separates checkout acceptance from order persistence.
-3. What can happen if stock is reserved but publishing fails.
-4. Why consumers must be idempotent.
-5. The difference between an accepted checkout and a completed order.
-6. How inventory correctness should be tested under concurrency.
-7. Why achieved RPS may be lower than configured RPS.
-8. What P95/P99 latency and dropped iterations mean.
-9. How you would diagnose the dead-letter message.
-10. What you would improve before deploying to production.
